@@ -1,0 +1,324 @@
+name: Build SukiSU Ultra Kernel + Manager for OPPO Reno6 Pro
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: '内核分支或标签 (默认 master)'
+        required: false
+        default: 'master'
+      manager_version:
+        description: '管理器版本 (留空则用最新 master)'
+        required: false
+        default: ''
+
+env:
+  KERNEL_PATH: kernel
+  SUSFS_PATH: susfs4ksu
+  KERNEL_DEFCONFIG: oppo6771_defconfig
+  KERNEL_NAME: SukiSU-Ultra
+
+jobs:
+  # ==================== 编译内核 ====================
+  build_kernel:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 释放磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          sudo apt clean
+
+      - name: 检出内核源码
+        uses: actions/checkout@v4
+        with:
+          repository: hotianbexuanto/android_kernel_mtk6893_sukisu
+          ref: ${{ github.event.inputs.kernel_branch }}
+          path: ${{ env.KERNEL_PATH }}
+
+      - name: 检出 SUSFS 源码
+        run: |
+          git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git ${{ env.SUSFS_PATH }}
+
+      - name: 缓存工具链（Clang + Gradle）
+        uses: actions/cache@v4
+        with:
+          path: |
+            /opt/clang
+            ~/.gradle/caches
+            ~/.ccache
+          key: ${{ runner.os }}-toolchain-${{ hashFiles('.github/workflows/build-sukisu-ultra.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-toolchain-
+
+      - name: 安装编译依赖与 Clang 16
+        run: |
+          sudo apt update
+          sudo apt install -y bc bison build-essential ccache cpio flex \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libelf-dev \
+            libncurses5-dev libssl-dev lz4 lzop kmod python3 rsync wget
+          
+          if [ ! -d "/opt/clang" ]; then
+            wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-16.0.0/clang+llvm-16.0.0-x86_64-linux-gnu-ubuntu-18.04.tar.xz
+            tar -xf clang+llvm-*.tar.xz
+            sudo mv clang+llvm-16.0.0-x86_64-linux-gnu-ubuntu-18.04 /opt/clang
+          fi
+          echo "/opt/clang/bin" >> $GITHUB_PATH
+
+      - name: 设置交叉编译环境变量
+        run: |
+          echo "ARCH=arm64" >> $GITHUB_ENV
+          echo "SUBARCH=arm64" >> $GITHUB_ENV
+          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "LD=ld.lld" >> $GITHUB_ENV
+          echo "AR=llvm-ar" >> $GITHUB_ENV
+          echo "NM=llvm-nm" >> $GITHUB_ENV
+          echo "STRIP=llvm-strip" >> $GITHUB_ENV
+          echo "OBJCOPY=llvm-objcopy" >> $GITHUB_ENV
+          echo "OBJDUMP=llvm-objdump" >> $GITHUB_ENV
+
+      - name: 检查内核源码完整性
+        run: |
+          cd ${{ env.KERNEL_PATH }}
+          [ -f "Makefile" ] || { echo "❌ 缺少 Makefile"; exit 1; }
+          [ -f "arch/arm64/configs/${{ env.KERNEL_DEFCONFIG }}" ] || \
+            { echo "❌ 缺少配置文件: ${{ env.KERNEL_DEFCONFIG }}"; exit 1; }
+
+      - name: 应用 SUSFS 补丁
+        run: |
+          cd ${{ env.KERNEL_PATH }}
+          
+          # 检查 SUSFS 源码
+          [ -f "../${{ env.SUSFS_PATH }}/kernel_patches/susfs.c" ] || \
+            { echo "❌ 缺少 susfs.c"; exit 1; }
+          
+          # 备份原始 fs 目录（可选）
+          cp -r fs fs.backup 2>/dev/null || true
+          
+          # 创建 susfs 目录并复制核心文件
+          mkdir -p fs/susfs
+          cp ../${{ env.SUSFS_PATH }}/kernel_patches/susfs.c fs/susfs/
+          cp ../${{ env.SUSFS_PATH }}/kernel_patches/susfs.h fs/susfs/
+          
+          # 创建 fs/susfs/Makefile
+          cat > fs/susfs/Makefile << 'EOF'
+# SPDX-License-Identifier: GPL-2.0
+obj-$(CONFIG_SUSFS) += susfs.o
+ccflags-y := -DDEBUG
+EOF
+          
+          # 创建 fs/susfs/Kconfig
+          cat > fs/susfs/Kconfig << 'EOF'
+config SUSFS
+	tristate "SUSFS (SukiSU File System)"
+	depends on OVERLAY_FS
+	help
+	  SukiSU Ultra KernelSU SUSFS feature for enhanced file system operations.
+	  Say M here to compile SUSFS as a module, or Y to build it into the kernel.
+EOF
+          
+          # 修改 fs/Kconfig 引入 susfs
+          if ! grep -q "source \"fs/susfs/Kconfig\"" fs/Kconfig; then
+            sed -i '/^menu "File systems"/,/^endmenu/ s/^endmenu$/source "fs\/susfs\/Kconfig"\n&/' fs/Kconfig
+          fi
+          
+          # 修改 fs/Makefile 加入 susfs 编译
+          if ! grep -q "obj-\$(CONFIG_SUSFS)" fs/Makefile; then
+            sed -i '/^obj-y += overlayfs\//a obj-\$(CONFIG_SUSFS)\t\t+= susfs\/' fs/Makefile
+          fi
+          
+          echo "✅ SUSFS 补丁应用完成"
+
+      - name: 配置内核（启用 SUSFS）
+        run: |
+          cd ${{ env.KERNEL_PATH }}
+          # 加载默认配置
+          make ${{ env.KERNEL_DEFCONFIG }}
+          
+          # 自定义版本号
+          LOCALVER="-SukiSU-$(date +%Y%m%d-%H%M)"
+          echo "LOCALVERSION=$LOCALVER" >> $GITHUB_ENV
+          
+          # 启用选项
+          ./scripts/config --enable CONFIG_SUSFS
+          ./scripts/config --module CONFIG_SUSFS
+          ./scripts/config --set-str CONFIG_LOCALVERSION "$LOCALVER"
+          # 禁用冲突选项
+          ./scripts/config --disable CONFIG_KSU
+          ./scripts/config --disable CONFIG_KSU_DEBUG
+          ./scripts/config --disable CONFIG_IKCONFIG
+          ./scripts/config --disable CONFIG_IKCONFIG_PROC
+          # 可选调试
+          ./scripts/config --enable CONFIG_DEBUG_INFO
+          ./scripts/config --enable CONFIG_DEBUG_KERNEL
+          
+          make olddefconfig
+          
+          # 验证配置
+          grep -E "CONFIG_(SUSFS|KSU|LOCALVERSION)" .config || true
+          echo "✅ 内核配置完成"
+
+      - name: 编译内核（使用 ccache 加速）
+        run: |
+          cd ${{ env.KERNEL_PATH }}
+          export USE_CCACHE=1
+          export CCACHE_COMPRESS=1
+          ccache -M 2G
+          
+          make -j$(nproc) 2>&1 | tee build.log
+          make dtbs 2>&1 | tee dtbs.log
+          make modules 2>&1 | tee modules.log
+
+      - name: 验证内核镜像
+        run: |
+          cd ${{ env.KERNEL_PATH }}
+          KERNEL_SIZE=$(stat -c%s arch/arm64/boot/Image.gz 2>/dev/null || echo 0)
+          echo "内核大小: $((KERNEL_SIZE / 1024 / 1024)) MB"
+          if [ $KERNEL_SIZE -gt 30000000 ]; then
+            echo "⚠️ 内核文件较大，可能无法直接刷入"
+          fi
+          # 检查版本字符串
+          strings arch/arm64/boot/Image | grep -i "SukiSU" || true
+
+      - name: 打包 AnyKernel3 刷机包
+        run: |
+          cd ${{ env.KERNEL_PATH }}
+          mkdir -p anykernel3
+          cp arch/arm64/boot/Image.gz anykernel3/
+          find arch/arm64/boot/dts -name "*.dtb" -exec cp {} anykernel3/ \;
+          
+          # 模块
+          mkdir -p anykernel3/modules/system/lib/modules
+          find . -name "*.ko" -exec cp {} anykernel3/modules/system/lib/modules/ \;
+          
+          cat > anykernel3/anykernel.sh << 'EOF'
+#!/sbin/sh
+ui_print ">>> Flashing SukiSU Ultra Kernel for OPPO Reno6 Pro"
+dump_boot
+patch_cmdline
+write_boot
+ui_print ">>> Done! Reboot now."
+EOF
+          chmod 755 anykernel3/anykernel.sh
+          
+          cd anykernel3
+          zip -r9 ../SukiSU-Kernel-AnyKernel3.zip ./*
+          
+      - name: 上传内核产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kernel-Artifacts
+          path: |
+            ${{ env.KERNEL_PATH }}/SukiSU-Kernel-AnyKernel3.zip
+            ${{ env.KERNEL_PATH }}/arch/arm64/boot/Image.gz
+            ${{ env.KERNEL_PATH }}/build.log
+            ${{ env.KERNEL_PATH }}/dtbs.log
+            ${{ env.KERNEL_PATH }}/modules.log
+          retention-days: 7
+
+  # ==================== 编译管理器 APK ====================
+  build_manager:
+    runs-on: ubuntu-22.04
+    needs: build_kernel
+    if: always()   # 即使内核编译失败，也尝试编译管理器
+    steps:
+      - name: 检出管理器源码
+        uses: actions/checkout@v4
+        with:
+          repository: SukiSU-Ultra/SukiSU-Ultra
+          ref: ${{ github.event.inputs.manager_version || 'master' }}
+          path: manager_src
+
+      - name: 设置 Java 环境
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 设置 Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 生成签名密钥并编译 Release APK
+        run: |
+          cd manager_src/manager
+          chmod +x gradlew
+          
+          # 生成调试密钥（用于 release 签名）
+          keytool -genkey -v -keystore keystore.jks \
+            -alias sukisu -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android \
+            -dname "CN=SukiSU, OU=SukiSU, O=SukiSU, L=Beijing, ST=Beijing, C=CN" \
+            -noprompt
+          
+          # 编译 release 版本
+          ./gradlew assembleRelease \
+            -Pandroid.injected.signing.store.file=keystore.jks \
+            -Pandroid.injected.signing.store.password=android \
+            -Pandroid.injected.signing.key.alias=sukisu \
+            -Pandroid.injected.signing.key.password=android \
+            --no-daemon
+
+      - name: 上传管理器 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SukiSU-Manager-APK
+          path: manager_src/manager/build/outputs/apk/release/*.apk
+          retention-days: 7
+
+  # ==================== 最终打包发布 ====================
+  package_release:
+    needs: [build_kernel, build_manager]
+    if: always() && (needs.build_kernel.result == 'success' || needs.build_manager.result == 'success')
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 下载所有产物
+        uses: actions/download-artifact@v4
+
+      - name: 创建完整发布包
+        run: |
+          mkdir -p SukiSU-Release
+          cp Kernel-Artifacts/*.zip SukiSU-Release/ 2>/dev/null || true
+          cp SukiSU-Manager-APK/*.apk SukiSU-Release/ 2>/dev/null || true
+          
+          cat > SukiSU-Release/README.md << EOF
+# SukiSU Ultra Kernel + Manager for OPPO Reno6 Pro
+
+构建时间: $(date '+%Y-%m-%d %H:%M:%S UTC')
+内核分支: ${{ github.event.inputs.kernel_branch }}
+管理器版本: ${{ github.event.inputs.manager_version || 'master' }}
+
+## 包含文件
+- SukiSU-Kernel-AnyKernel3.zip : 内核刷机包
+- SukiSU-Manager-*.apk : 管理器应用
+
+## 刷机步骤
+1. 安装管理器 APK
+2. 重启到恢复模式 (TWRP or KernelSU 管理器)
+3. 刷入 AnyKernel3.zip
+4. 重启手机
+EOF
+          
+          zip -r SukiSU-Complete-Release.zip SukiSU-Release/
+
+      - name: 上传完整发布包
+        uses: actions/upload-artifact@v4
+        with:
+          name: SukiSU-Complete-Release
+          path: SukiSU-Complete-Release.zip
+          retention-days: 14
+
+  # ==================== 构建通知 ====================
+  notify:
+    needs: [build_kernel, build_manager]
+    if: always()
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 汇总结果
+        run: |
+          echo "========================================="
+          echo "🎉 构建工作流完成！"
+          echo "内核编译状态: ${{ needs.build_kernel.result }}"
+          echo "管理器编译状态: ${{ needs.build_manager.result }}"
+          echo "完整发布包状态: ${{ needs.package_release.result }}"
+          echo "========================================="
+          echo "下载地址: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
