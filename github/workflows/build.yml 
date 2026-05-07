@@ -1,0 +1,93 @@
+name: Build SukiSU Ultra Kernel for OPPO Reno6 Pro
+
+on:
+  workflow_dispatch:      # 允许手动触发
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout kernel source
+      uses: actions/checkout@v4
+      with:
+        path: kernel         # 内核源码将存放在 kernel/ 目录下
+
+    - name: Checkout SUSFS source
+      run: git clone https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+
+    - name: Setup build environment
+      run: |
+        sudo apt update
+        sudo apt install -y git-core gnupg flex bison build-essential zip curl \
+          zlib1g-dev gcc-multilib g++-multilib libc6-dev-i386 libncurses5 \
+          lib32ncurses5-dev x11proto-core-dev libx11-dev lib32z1-dev \
+          libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig python3 \
+          bc cpio gperf ccache libssl-dev liblz4-tool
+        # 使用 repo 工具（如果需要）
+        sudo curl --create-dirs -L -o /usr/local/bin/repo -O -L https://storage.googleapis.com/git-repo-downloads/repo
+        sudo chmod a+x /usr/local/bin/repo
+
+    - name: Apply SUSFS patches
+      run: |
+        cd kernel
+        # 1. 添加 SUSFS 内核模块文件
+        mkdir -p fs/susfs
+        cp ../susfs4ksu/kernel_patches/susfs.c fs/susfs/
+        cp ../susfs4ksu/kernel_patches/susfs.h fs/susfs/
+        # ...（其余补丁逻辑）
+        # 2. 修改 Kconfig 和 Makefile
+        echo 'source "fs/susfs/Kconfig"' >> fs/Kconfig
+        echo 'obj-$(CONFIG_SUSFS) += susfs/' >> fs/Makefile
+        # 3. 为 susfs 创建自己的 Kconfig 和 Makefile
+        cat > fs/susfs/Kconfig <<EOF
+    config SUSFS
+        tristate "SUSFS support"
+        help
+          SukiSU Ultra KernelSU SUSFS feature.
+    EOF
+        cat > fs/susfs/Makefile <<EOF
+    obj-\$(CONFIG_SUSFS) += susfs.o
+    EOF
+
+    - name: Configure kernel (Enable LOCALVERSION and SUSFS)
+      run: |
+        cd kernel
+        # 确保使用正确的配置文件。OPPO Reno6 Pro 使用 oppo6771_defconfig
+        make ARCH=arm64 oppo6771_defconfig
+        # 启用 SUSFS，自定义内核版本号，禁用可能冲突的选项
+        scripts/config --file .config -e CONFIG_SUSFS
+        scripts/config --file .config -e CONFIG_LOCALVERSION_AUTO
+        scripts/config --file .config --set-str CONFIG_LOCALVERSION "-SukiSU-SUSFS"
+        scripts/config --file .config -d CONFIG_KSU
+        scripts/config --file .config -d CONFIG_KSU_SUSFS
+        # 保存配置
+        make ARCH=arm64 savedefconfig
+        cp defconfig arch/arm64/configs/oppo6771_defconfig
+
+    - name: Build kernel
+      run: |
+        cd kernel
+        # 使用预置的 Clang 工具链和 GCC 交叉编译器
+        export PATH="/usr/bin:$PATH"
+        export CROSS_COMPILE="aarch64-linux-gnu-"
+        export CC="clang"
+        export LD="ld.lld"
+        export AR="llvm-ar"
+        export NM="llvm-nm"
+        export STRIP="llvm-strip"
+        export OBJCOPY="llvm-objcopy"
+        export OBJDUMP="llvm-objdump"
+        export READELF="llvm-readelf"
+        make ARCH=arm64 oppo6771_defconfig
+        make ARCH=arm64 -j$(nproc) 2>&1 | tee build.log
+
+    - name: Upload Kernel Image
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel-image
+        path: kernel/arch/arm64/boot/Image.gz
+    - name: Upload Kernel Log
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel-build-log
+        path: kernel/build.log
